@@ -32,7 +32,7 @@ import scala.deriving.Mirror
  * Listings and Lists, `java.util.Map` / `java.util.LinkedHashMap` for Mappings and Maps, plus
  * domain values (`Duration`, `DataSize`, `Pair`, `byte[]`, `java.util.regex.Pattern`).
  *
- * A `ConfigDecoder[T]` walks that runtime model and produces either a typed `T` or a `ConfigError`
+ * A `Decoder[T]` walks that runtime model and produces either a typed `T` or a `ConfigError`
  * carrying a path for navigation.
  *
  * Implementations are typeclass instances: provided as `given`s in this companion for primitives
@@ -40,49 +40,49 @@ import scala.deriving.Mirror
  * classes and `Mirror.SumOf` for Scala 3 enums; auto-derived via izumi `Tag` for Scala 3 union and
  * singleton-literal types.
  */
-trait ConfigDecoder[T] {
+trait Decoder[T] {
   def decode(value: Any): Either[ConfigError, T]
 }
 
-object ConfigDecoder {
+object Decoder {
 
-  def apply[T](implicit d: ConfigDecoder[T]): ConfigDecoder[T] = d
+  def apply[T](implicit d: Decoder[T]): Decoder[T] = d
 
-  def instance[T](f: Any => Either[ConfigError, T]): ConfigDecoder[T] = {
-    new ConfigDecoder[T] { def decode(value: Any): Either[ConfigError, T] = f(value) }
+  def instance[T](f: Any => Either[ConfigError, T]): Decoder[T] = {
+    new Decoder[T] { def decode(value: Any): Either[ConfigError, T] = f(value) }
   }
 
   // ---------- Primitive instances ----------
 
-  given ConfigDecoder[String] = instance {
+  given Decoder[String] = instance {
     case s: String => Right(s)
     case other     => Left(ConfigError.TypeMismatch("String", other))
   }
 
-  given ConfigDecoder[Boolean] = instance {
+  given Decoder[Boolean] = instance {
     case b: java.lang.Boolean => Right(b.booleanValue)
     case other                => Left(ConfigError.TypeMismatch("Boolean", other))
   }
 
-  given ConfigDecoder[Long] = instance {
+  given Decoder[Long] = instance {
     case l: java.lang.Long => Right(l.longValue)
     case other             => Left(ConfigError.TypeMismatch("Long", other))
   }
 
-  given ConfigDecoder[Int] = instance {
+  given Decoder[Int] = instance {
     case l: java.lang.Long if l.longValue.isValidInt => Right(l.intValue)
     case l: java.lang.Long                           =>
       Left(ConfigError.Custom(s"Pkl Int $l does not fit in Scala Int (32-bit)."))
     case other => Left(ConfigError.TypeMismatch("Int", other))
   }
 
-  given ConfigDecoder[Double] = instance {
+  given Decoder[Double] = instance {
     case d: java.lang.Double => Right(d.doubleValue)
     case l: java.lang.Long   => Right(l.doubleValue)
     case other               => Left(ConfigError.TypeMismatch("Double", other))
   }
 
-  given ConfigDecoder[Float] = instance {
+  given Decoder[Float] = instance {
     case d: java.lang.Double => Right(d.floatValue)
     case l: java.lang.Long   => Right(l.floatValue)
     case other               => Left(ConfigError.TypeMismatch("Float", other))
@@ -90,32 +90,32 @@ object ConfigDecoder {
 
   // ---------- Higher-kinded instances ----------
 
-  given [A](using d: ConfigDecoder[A]): ConfigDecoder[Option[A]] = instance {
+  given [A](using d: Decoder[A]): Decoder[Option[A]] = instance {
     case null | _: PNull => Right(None)
     case other           => d.decode(other).map(Some(_))
   }
 
-  given [A](using d: ConfigDecoder[A]): ConfigDecoder[Seq[A]] = instance {
+  given [A](using d: Decoder[A]): Decoder[Seq[A]] = instance {
     case xs: java.util.Collection[?] => decodeCollection(xs, d).map(_.toSeq)
     case other                       => Left(ConfigError.TypeMismatch("Listing/List", other))
   }
 
-  given [A](using d: ConfigDecoder[A]): ConfigDecoder[List[A]] = instance {
+  given [A](using d: Decoder[A]): Decoder[List[A]] = instance {
     case xs: java.util.Collection[?] => decodeCollection(xs, d).map(_.toList)
     case other                       => Left(ConfigError.TypeMismatch("Listing/List", other))
   }
 
-  given [A](using d: ConfigDecoder[A]): ConfigDecoder[Vector[A]] = instance {
+  given [A](using d: Decoder[A]): Decoder[Vector[A]] = instance {
     case xs: java.util.Collection[?] => decodeCollection(xs, d).map(_.toVector)
     case other                       => Left(ConfigError.TypeMismatch("Listing/List", other))
   }
 
-  given [A](using d: ConfigDecoder[A]): ConfigDecoder[Set[A]] = instance {
+  given [A](using d: Decoder[A]): Decoder[Set[A]] = instance {
     case xs: java.util.Collection[?] => decodeCollection(xs, d).map(_.toSet)
     case other                       => Left(ConfigError.TypeMismatch("Listing/List/Set", other))
   }
 
-  given [K, V](using kd: ConfigDecoder[K], vd: ConfigDecoder[V]): ConfigDecoder[Map[K, V]] = {
+  given [K, V](using kd: Decoder[K], vd: Decoder[V]): Decoder[Map[K, V]] = {
     instance {
       case m: java.util.Map[?, ?] =>
         import scala.jdk.CollectionConverters.*
@@ -130,7 +130,7 @@ object ConfigDecoder {
     }
   }
 
-  given [A, B](using da: ConfigDecoder[A], db: ConfigDecoder[B]): ConfigDecoder[(A, B)] = {
+  given [A, B](using da: Decoder[A], db: Decoder[B]): Decoder[(A, B)] = {
     instance {
       case p: org.pkl.core.Pair[?, ?] =>
         for {
@@ -141,7 +141,7 @@ object ConfigDecoder {
     }
   }
 
-  given [L, R](using ld: ConfigDecoder[L], rd: ConfigDecoder[R]): ConfigDecoder[Either[L, R]] = {
+  given [L, R](using ld: Decoder[L], rd: Decoder[R]): Decoder[Either[L, R]] = {
     instance { value =>
       ld.decode(value) match {
         case Right(l) => Right(Left(l))
@@ -152,7 +152,7 @@ object ConfigDecoder {
 
   // ---------- Domain instances (porting the most common pkl-config-java conversions) ----------
 
-  given ConfigDecoder[scala.concurrent.duration.Duration] = instance {
+  given Decoder[scala.concurrent.duration.Duration] = instance {
     case d: org.pkl.core.Duration =>
       val v = d.getValue
       val unit = d.getUnit.toTimeUnit
@@ -169,20 +169,20 @@ object ConfigDecoder {
     case other => Left(ConfigError.TypeMismatch("Duration", other))
   }
 
-  given ConfigDecoder[scala.concurrent.duration.FiniteDuration] = instance { value =>
-    summon[ConfigDecoder[scala.concurrent.duration.Duration]].decode(value).flatMap {
+  given Decoder[scala.concurrent.duration.FiniteDuration] = instance { value =>
+    summon[Decoder[scala.concurrent.duration.Duration]].decode(value).flatMap {
       case fd: scala.concurrent.duration.FiniteDuration => Right(fd)
       case _ => Left(ConfigError.Custom("Pkl Duration is not finite"))
     }
   }
 
-  given ConfigDecoder[java.time.Instant] = instance {
+  given Decoder[java.time.Instant] = instance {
     case s: String         => Right(java.time.Instant.parse(s))
     case l: java.lang.Long => Right(java.time.Instant.ofEpochMilli(l))
     case other             => Left(ConfigError.TypeMismatch("Instant", other))
   }
 
-  given ConfigDecoder[scala.util.matching.Regex] = instance {
+  given Decoder[scala.util.matching.Regex] = instance {
     case s: String                  => Right(s.r)
     case p: java.util.regex.Pattern => Right(p.pattern.r)
     case other                      => Left(ConfigError.TypeMismatch("Regex/String", other))
@@ -190,7 +190,7 @@ object ConfigDecoder {
 
   // ---------- Mirror-driven product (case class) derivation ----------
 
-  inline given derived[T <: Product](using m: Mirror.ProductOf[T]): ConfigDecoder[T] = {
+  inline given derived[T <: Product](using m: Mirror.ProductOf[T]): Decoder[T] = {
     val labels = summonLabels[m.MirroredElemLabels]
     val decoders = summonDecoders[m.MirroredElemTypes]
     instance {
@@ -217,11 +217,11 @@ object ConfigDecoder {
     }
   }
 
-  inline private def summonDecoders[Types <: Tuple]: List[ConfigDecoder[Any]] = {
+  inline private def summonDecoders[Types <: Tuple]: List[Decoder[Any]] = {
     inline erasedValue[Types] match {
       case _: EmptyTuple => Nil
       case _: (h *: t)   =>
-        summonInline[ConfigDecoder[h]].asInstanceOf[ConfigDecoder[Any]] :: summonDecoders[t]
+        summonInline[Decoder[h]].asInstanceOf[Decoder[Any]] :: summonDecoders[t]
     }
   }
 
@@ -232,7 +232,7 @@ object ConfigDecoder {
    * (`"hello"`). Lower priority than Mirror-derived instances by virtue of being on the companion's
    * outer scope; the implicit-search rules pick Mirror first when applicable.
    */
-  inline given fromTag[T](using tag: Tag[T]): ConfigDecoder[T] = {
+  inline given fromTag[T](using tag: Tag[T]): Decoder[T] = {
     val ref = tag.tag.ref
     ref match {
       case u: UnionReference =>
@@ -243,20 +243,20 @@ object ConfigDecoder {
             singletonDecoder[T](lit.name)
           case _ =>
             throw new IllegalStateException(
-              s"No ConfigDecoder for type `${tag.tag}`. " +
-                s"Provide a `given ConfigDecoder[${tag.tag}]` or `derives ConfigDecoder`."
+              s"No Decoder for type `${tag.tag}`. " +
+                s"Provide a `given Decoder[${tag.tag}]` or `derives Decoder`."
             )
         }
       case _ =>
-        throw new IllegalStateException(s"No ConfigDecoder for type `${tag.tag}`.")
+        throw new IllegalStateException(s"No Decoder for type `${tag.tag}`.")
     }
   }
 
-  private def unionDecoder[T](u: UnionReference): ConfigDecoder[T] = instance { value =>
+  private def unionDecoder[T](u: UnionReference): Decoder[T] = instance { value =>
     // Build a per-member decoder via Tag-recursion. We can't reify a Tag for an arbitrary
     // AbstractReference at runtime, so we materialize a thin probe: try each branch by name.
     // For the spike, we delegate to izumi's branch list and expect each branch to be a
-    // type that has its own ConfigDecoder visible in this companion's implicit scope.
+    // type that has its own Decoder visible in this companion's implicit scope.
     val errors = scala.collection.mutable.ListBuffer.empty[ConfigError]
     u.refs.iterator
       .flatMap { branch =>
@@ -289,7 +289,7 @@ object ConfigDecoder {
       n.ref match {
         case lit: SymName.SymLiteral =>
           val (expected, _) = parseLiteral(lit.name)
-          summon[ConfigDecoder[String]].decode(value).flatMap { decoded =>
+          summon[Decoder[String]].decode(value).flatMap { decoded =>
             if (decoded == expected) Right(decoded)
             else {
               Left(ConfigError.Custom(s"Singleton mismatch: expected `$expected`, got `$decoded`"))
@@ -297,13 +297,13 @@ object ConfigDecoder {
           }
         case sym: SymName.NamedSymbol =>
           sym.name match {
-            case "scala.Int"           => summon[ConfigDecoder[Int]].decode(value)
-            case "scala.Long"          => summon[ConfigDecoder[Long]].decode(value)
-            case "scala.Boolean"       => summon[ConfigDecoder[Boolean]].decode(value)
-            case "scala.Double"        => summon[ConfigDecoder[Double]].decode(value)
-            case "scala.Float"         => summon[ConfigDecoder[Float]].decode(value)
-            case "java.lang.String"    => summon[ConfigDecoder[String]].decode(value)
-            case "scala.Predef.String" => summon[ConfigDecoder[String]].decode(value)
+            case "scala.Int"           => summon[Decoder[Int]].decode(value)
+            case "scala.Long"          => summon[Decoder[Long]].decode(value)
+            case "scala.Boolean"       => summon[Decoder[Boolean]].decode(value)
+            case "scala.Double"        => summon[Decoder[Double]].decode(value)
+            case "scala.Float"         => summon[Decoder[Float]].decode(value)
+            case "java.lang.String"    => summon[Decoder[String]].decode(value)
+            case "scala.Predef.String" => summon[Decoder[String]].decode(value)
             case other                 =>
               Left(ConfigError.Custom(s"Union branch `$other` not supported in spike"))
           }
@@ -312,7 +312,7 @@ object ConfigDecoder {
     case _ => Left(ConfigError.Custom(s"Unsupported union branch: $branch"))
   }
 
-  private def singletonDecoder[T](rendered: String): ConfigDecoder[T] = instance { value =>
+  private def singletonDecoder[T](rendered: String): Decoder[T] = instance { value =>
     val (expected, _) = parseLiteral(rendered)
     value match {
       case s: String if s == expected            => Right(s.asInstanceOf[T])
@@ -337,7 +337,7 @@ object ConfigDecoder {
 
   private def decodeCollection[A](
       xs: java.util.Collection[?],
-      d: ConfigDecoder[A]
+      d: Decoder[A]
   ): Either[ConfigError, IndexedSeq[A]] = {
     import scala.jdk.CollectionConverters.*
     val results = xs.asScala.iterator.map(d.decode).toList

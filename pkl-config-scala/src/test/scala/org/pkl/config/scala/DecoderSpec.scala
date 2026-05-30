@@ -21,7 +21,7 @@ import org.scalatest.Outcome
 import org.scalatest.funsuite.FixtureAnyFunSuite
 
 /**
- * Spike validation for the typeclass-driven `ConfigDecoder` design. Touches enough shapes to judge
+ * Spike validation for the typeclass-driven `Decoder` design. Touches enough shapes to judge
  * whether the API ergonomics are sane:
  *
  *   - primitives (Int, String, Boolean, Long)
@@ -35,9 +35,9 @@ import org.scalatest.funsuite.FixtureAnyFunSuite
  *   - singleton string-literal via izumi `Tag` fallback
  *   - direct domain decoder (Duration)
  */
-class ConfigDecoderSpec extends FixtureAnyFunSuite {
+class DecoderSpec extends FixtureAnyFunSuite {
 
-  import ConfigDecoderSpec.*
+  import DecoderSpec.*
 
   type FixtureParam = Evaluator
 
@@ -154,8 +154,8 @@ class ConfigDecoderSpec extends FixtureAnyFunSuite {
   }
 }
 
-object ConfigDecoderSpec {
-  case class Person(name: String, age: Int) derives ConfigDecoder
-  case class Address(zip: String, city: String) derives ConfigDecoder
-  case class Citizen(name: String, home: Address) derives ConfigDecoder
+object DecoderSpec {
+  case class Person(name: String, age: Int) derives Decoder
+  case class Address(zip: String, city: String) derives Decoder
+  case class Citizen(name: String, home: Address) derives Decoder
 }
