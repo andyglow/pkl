@@ -152,10 +152,87 @@ class DecoderSpec extends FixtureAnyFunSuite {
       pmodule.as["hello"]("value")
     }
   }
+
+  // ---------- Sum-type derivation (Mirror.SumOf) ----------
+
+  test("singleton enum decodes from PObject with branch class name") { ev =>
+    val code = """
+      |open class Color
+      |class Red extends Color
+      |class Green extends Color
+      |class Blue extends Color
+      |value: Color = new Green {}
+      |""".stripMargin
+    val pmodule = ev.evaluate(ModuleSource.text(code))
+    assert(pmodule.as[Color]("value") == Color.Green)
+  }
+
+  test("singleton enum decodes via `_type` discriminator") { ev =>
+    val pmodule = ev.evaluate(ModuleSource.text("""value: Dynamic = new { _type = "Red" }"""))
+    assert(pmodule.as[Color]("value") == Color.Red)
+  }
+
+  test("singleton enum errors on unknown branch") { ev =>
+    val pmodule = ev.evaluate(ModuleSource.text("""value: Dynamic = new { _type = "Yellow" }"""))
+    val err = intercept[ConfigError] { pmodule.as[Color]("value") }
+    assert(err.getMessage.contains("Unknown sum branch `Yellow`"))
+    assert(err.getMessage.contains("Red, Green, Blue"))
+  }
+
+  test("sealed trait dispatches by Pkl class name") { ev =>
+    val code = """
+      |open class Shape
+      |class Square extends Shape { sideLength: Float }
+      |class Circle extends Shape { radius: Float }
+      |value: Shape = new Square { sideLength = 2.0 }
+      |""".stripMargin
+    val pmodule = ev.evaluate(ModuleSource.text(code))
+    assert(pmodule.as[Shape]("value") == Square(2.0))
+  }
+
+  test("sealed trait dispatches each branch correctly") { ev =>
+    val code = """
+      |open class Shape
+      |class Square extends Shape { sideLength: Float }
+      |class Circle extends Shape { radius: Float }
+      |s: Shape = new Square { sideLength = 3.5 }
+      |c: Shape = new Circle { radius = 1.0 }
+      |""".stripMargin
+    val pmodule = ev.evaluate(ModuleSource.text(code))
+    assert(pmodule.as[Shape]("s") == Square(3.5))
+    assert(pmodule.as[Shape]("c") == Circle(1.0))
+  }
+
+  test("sealed trait falls back to `_type` discriminator when class name doesn't match") { ev =>
+    val code = """
+      |value: Dynamic = new {
+      |  _type = "Square"
+      |  sideLength = 7.0
+      |}
+      |""".stripMargin
+    val pmodule = ev.evaluate(ModuleSource.text(code))
+    assert(pmodule.as[Shape]("value") == Square(7.0))
+  }
+
+  test("sealed trait errors when neither class name nor `_type` identifies a branch") { ev =>
+    val code = """
+      |value: Dynamic = new { sideLength = 1.0 }
+      |""".stripMargin
+    val pmodule = ev.evaluate(ModuleSource.text(code))
+    val err = intercept[ConfigError] { pmodule.as[Shape]("value") }
+    assert(err.getMessage.contains("Cannot determine sum branch"))
+    assert(err.getMessage.contains("Square, Circle"))
+  }
 }
 
 object DecoderSpec {
   case class Person(name: String, age: Int) derives Decoder
   case class Address(zip: String, city: String) derives Decoder
   case class Citizen(name: String, home: Address) derives Decoder
+
+  enum Color derives Decoder { case Red, Green, Blue }
+
+  sealed trait Shape derives Decoder
+  case class Square(sideLength: Double) extends Shape derives Codec
+  case class Circle(radius: Double) extends Shape derives Codec
 }

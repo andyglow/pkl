@@ -17,8 +17,10 @@ package org.pkl.config.scala
 
 import org.pkl.core.{DurationUnit, PClassInfo, PNull, PObject, Duration as PDuration, Pair as PPair}
 
+import scala.collection.mutable
 import scala.compiletime.{constValue, erasedValue, summonInline}
 import scala.deriving.Mirror
+import scala.jdk.CollectionConverters.*
 import scala.quoted.*
 
 /** Encodes a Scala value into a Pkl runtime value (`String`, `java.lang.Long`, `PObject`, ...). */
@@ -34,11 +36,17 @@ val Encoder = Codec.Encoder
 val Decoder = Codec.Decoder
 
 /**
- * A round-trip-capable typeclass: `Encoder[T] with Decoder[T]`.
+ * A round-trip-capable typeclass bundling encode and decode for a single type.
+ *
+ * Codec is a separate trait, NOT a subtype of `Encoder[T]` and `Decoder[T]`. Subtyping would make
+ * `Codec.derived` a candidate for `Decoder[T]` queries at the same priority as hand-written
+ * decoders (e.g. `Decoder.decoderForEither`), with no clean way to disambiguate. With subtyping
+ * dropped, `Decoder.fromCodec[T]` (defined in `LowPriorityDecoders`) is the explicit bridge —
+ * lower priority than direct decoders, higher than the macro fallback for unions/literals.
  *
  * Round-trippable types ship as `given Codec[T]` so a single instance covers both directions; types
- * for which one side is meaningless (e.g. `Either[L, R]` — Pkl has no native Either, encoding has
- * to pick a side) ship a `given Decoder[T]` (or `given Encoder[T]`) only.
+ * for which one side is meaningless (e.g. `Either[L, R]`) ship a `given Decoder[T]` (or
+ * `given Encoder[T]`) only.
  *
  * The Pkl runtime value model that encoders produce and decoders consume:
  *   - boxed primitives: `java.lang.Long`, `java.lang.Double`, `java.lang.Boolean`, `String`
@@ -51,7 +59,9 @@ val Decoder = Codec.Decoder
  *     hand back its `.asJava` view (insertion order preserved).
  *   - domain values: `org.pkl.core.{Duration, Pair}`, `byte[]`, `java.util.regex.Pattern`
  */
-trait Codec[T] extends Codec.Encoder[T], Codec.Decoder[T] { self =>
+trait Codec[T] { self =>
+  def encode(value: T): Any
+  def decode(value: Any): Either[ConfigError, T]
 
   /** Newtype-style profunctor map: derive a `Codec[U]` from a bijection between `T` and `U`. */
   def imap[U](f: T => U, g: U => T): Codec[U] = new Codec[U] {
@@ -60,10 +70,7 @@ trait Codec[T] extends Codec.Encoder[T], Codec.Decoder[T] { self =>
   }
 }
 
-object Codec {
-
-  import scala.collection.mutable
-  import scala.jdk.CollectionConverters.*
+object Codec extends LowPriorityCodecs {
 
   // ---------- Encoder ----------
 
@@ -81,11 +88,11 @@ object Codec {
       def encode(value: T): Any = f(value)
     }
 
-    /** Subsumes any `Codec[T]` as `Encoder[T]`. */
-    given fromCodec[T](using c: Codec[T]): Encoder[T] = c
+    /** Wraps any `Codec[T]` as an `Encoder[T]`. */
+    given fromCodec[T](using c: Codec[T]): Encoder[T] = instance(c.encode)
 
-    /** Used by `derives Encoder` on case classes; delegates to `Codec.derived`. */
-    inline def derived[T <: Product](using m: Mirror.ProductOf[T]): Encoder[T] = Codec.derived[T]
+    /** Used by `derives Encoder` on case classes, sealed traits, and enums; delegates to `Codec.derived`. */
+    inline def derived[T](using m: Mirror.Of[T]): Encoder[T] = instance(Codec.derived[T].encode)
   }
 
   // ---------- Decoder ----------
@@ -109,12 +116,14 @@ object Codec {
       def decode(value: Any): Either[ConfigError, T] = f(value)
     }
 
-    /** Subsumes any `Codec[T]` as `Decoder[T]`. */
-    given fromCodec[T](using c: Codec[T]): Decoder[T] = c
-
     /**
      * `Either[L, R]` is decoder-only: Pkl unions decode by source dispatch (try `L`, fall back to
      * `R`); encoding back has no canonical inverse since the source union dropped the tag.
+     *
+     * Direct member of the companion (highest priority) so it wins over the auto-derived
+     * `Codec[Either[L, R]]` reachable through `LowPriorityCodecs.derived` — Either is a Scala
+     * sealed sum (so it has a `Mirror.SumOf`), but we want union-style source dispatch instead of
+     * the default class-name dispatch.
      */
     given decoderForEither[L, R](using ld: Decoder[L], rd: Decoder[R]): Decoder[Either[L, R]] = {
       instance { value =>
@@ -125,21 +134,30 @@ object Codec {
       }
     }
 
-    /** Used by `derives Decoder` on case classes; delegates to `Codec.derived`. */
-    inline def derived[T <: Product](using m: Mirror.ProductOf[T]): Decoder[T] = Codec.derived[T]
+    /** Used by `derives Decoder` on case classes, sealed traits, and enums; delegates to `Codec.derived`. */
+    inline def derived[T](using m: Mirror.Of[T]): Decoder[T] = instance(Codec.derived[T].decode)
   }
 
   /**
-   * Lower-priority givens. Members defined here lose to direct members of `Decoder` companion, so
-   * `fromCodec[T]` (specific) wins over the macro fallback for any type with a `Codec[T]`.
+   * Mid-priority givens. Loses to hand-written direct members (e.g. `decoderForEither`); wins over
+   * the macro fallback for unions/literals.
    */
-  sealed trait LowPriorityDecoders {
+  sealed trait LowPriorityDecoders extends LowestPriorityDecoders {
+
+    /** Wraps any `Codec[T]` as a `Decoder[T]` — covers products, sealed sums, primitives, etc. */
+    given fromCodec[T](using c: Codec[T]): Decoder[T] = Decoder.instance(c.decode)
+  }
+
+  /**
+   * Lowest-priority given. The macro pattern-matches the call-site `TypeRepr`; only types with no
+   * `Codec[T]` and no hand-written `Decoder[T]` reach this rule.
+   */
+  sealed trait LowestPriorityDecoders {
 
     /**
      * Catch-all for Scala 3 unions (`A | B`) and singleton-literal types (`"hello"`, `42`, `true`).
      * Implemented as a quoted macro that pattern-matches the call-site `TypeRepr` and emits an
-     * appropriate decoder. Compile-time error if `T` is none of those (and has no other in-scope
-     * decoder, since this rule is the lowest priority).
+     * appropriate decoder. Compile-time error if `T` is none of those.
      */
     inline given derivedFromType[T]: Decoder[T] = ${ CodecMacros.derivedDecoderFromType[T] }
   }
@@ -156,76 +174,6 @@ object Codec {
   def instance[T](enc: T => Any, dec: Any => Either[ConfigError, T]): Codec[T] = new Codec[T] {
     def encode(value: T): Any = enc(value)
     def decode(value: Any): Either[ConfigError, T] = dec(value)
-  }
-
-  // ---------- Mirror-based derivation for products ----------
-
-  /**
-   * Auto-derives `Codec[T]` for any case class whose every field has a `Codec`. Encodes to a
-   * `PObject(PClassInfo.Dynamic, ...)` so renderers emit a Pkl object; decodes from a `PObject`
-   * (which is what evaluation produces).
-   *
-   * Backs `derives Codec`, `derives Decoder`, `derives Encoder` on products. Sum types (sealed
-   * traits, Scala 3 enums) need a `Mirror.SumOf`-driven companion derivation — TODO.
-   */
-  inline given derived[T <: Product](using m: Mirror.ProductOf[T]): Codec[T] = {
-    productCodec[T](summonLabels[m.MirroredElemLabels], summonCodecs[m.MirroredElemTypes], m)
-  }
-
-  /**
-   * Non-inline assembly for Mirror-derived product codecs. Keeping this out-of-line means the
-   * anonymous class is defined once, not duplicated at every `derives` call site.
-   */
-  private def productCodec[T <: Product](
-      labels: List[String],
-      codecs: List[Codec[Any]],
-      m: Mirror.ProductOf[T]
-  ): Codec[T] = new Codec[T] {
-
-    def decode(value: Any): Either[ConfigError, T] = value match {
-      case obj: PObject =>
-        val props = obj.getProperties.asScala
-        val perField = labels.zip(codecs).map { (label, c) =>
-          props.get(label) match {
-            case None      => Left(ConfigError.MissingProperty(label))
-            case Some(raw) => c.decode(raw).left.map(_.at(label))
-          }
-        }
-        sequence(perField).map(values => m.fromProduct(Tuple.fromArray(values.toArray)))
-      case other =>
-        Left(ConfigError.TypeMismatch("PObject", other))
-    }
-
-    /**
-     * Encode as `PObject` with `PClassInfo.Dynamic` — a `Composite` that `PcfRenderer` /
-     * `JsonRenderer` / etc. render as a Pkl object. We don't carry the original Scala class name
-     * forward (we'd need a synthesized `PClassInfo` that round-trips through Pkl evaluation, which
-     * is out of scope), so all derived products land as Dynamic.
-     */
-    def encode(value: T): Any = {
-      val props = mutable.LinkedHashMap.empty[String, Any]
-      labels.iterator.zip(codecs.iterator).zipWithIndex.foreach { case ((label, c), i) =>
-        props.update(label, c.encode(value.productElement(i)))
-      }
-      // PObject's Java constructor takes `Map<String, Object>`. The cast bridges Scala `Any` and
-      // Java `Object` — same erasure at runtime.
-      new PObject(PClassInfo.Dynamic, props.asJava.asInstanceOf[java.util.Map[String, Object]])
-    }
-  }
-
-  inline private def summonLabels[Labels <: Tuple]: List[String] = {
-    inline erasedValue[Labels] match {
-      case _: EmptyTuple => Nil
-      case _: (h *: t)   => constValue[h].asInstanceOf[String] :: summonLabels[t]
-    }
-  }
-
-  inline private def summonCodecs[Types <: Tuple]: List[Codec[Any]] = {
-    inline erasedValue[Types] match {
-      case _: EmptyTuple => Nil
-      case _: (h *: t)   =>
-        summonInline[Codec[h]].asInstanceOf[Codec[Any]] :: summonCodecs[t]
-    }
   }
 
   // ---------- Primitive instances ----------
@@ -411,21 +359,194 @@ object Codec {
       case other                      => Left(ConfigError.TypeMismatch("Regex/String", other))
     }
   )
+}
 
-  // ---------- Helpers ----------
+/**
+ * `Codec.derived` lives here, one priority tier below `Codec`'s direct givens, so that hand-written
+ * decoders/encoders on companions of types like `Either` win over Mirror-driven derivation. (The
+ * `Codec` object is in the implicit scope of `Decoder[T]` because `Decoder` is a member of `Codec`;
+ * if `derived` lived directly on `Codec` it would compete head-to-head with `Decoder.decoderForEither`
+ * and produce ambiguity errors.)
+ *
+ * The derivation machinery (helpers, sum/product/singleton codecs) lives here too so the inline
+ * given can call them at expansion time. Members are public to satisfy inline-call visibility at
+ * the user's call site, but the trait is sealed and only `Codec` extends it.
+ */
+sealed trait LowPriorityCodecs {
+
+  /**
+   * Auto-derives `Codec[T]` for case classes, sealed traits, and Scala 3 enums via `Mirror`.
+   *
+   *   - Product (case class, including case object as zero-field product): encode to
+   *     `PObject(PClassInfo.Dynamic, ...)`; decode field-by-field from a `PObject`'s properties.
+   *   - Sum (sealed trait, enum): encode by dispatching to the branch Codec and re-tagging the
+   *     resulting `PObject` with the branch's name; decode by matching
+   *     `PObject.getClassInfo.getSimpleName` against branch labels, falling back to a `_type`
+   *     discriminator field. Pure-singleton enums (every branch a case object) currently encode as
+   *     PObject too — a future step may special-case them to encode as a `String` of the case name.
+   *
+   * Backs `derives Codec`, `derives Decoder`, `derives Encoder`.
+   */
+  inline given derived[T](using m: Mirror.Of[T]): Codec[T] = {
+    inline m match {
+      case s: Mirror.SumOf[T]     => derivedSum[T](s)
+      case p: Mirror.ProductOf[T] => derivedProduct[T](p)
+    }
+  }
+
+  inline def derivedProduct[T](m: Mirror.ProductOf[T]): Codec[T] =
+    productCodec[T](summonLabels[m.MirroredElemLabels], summonCodecs[m.MirroredElemTypes], m)
+
+  inline def derivedSum[T](m: Mirror.SumOf[T]): Codec[T] =
+    sumCodec[T](
+      summonLabels[m.MirroredElemLabels],
+      summonCodecs[m.MirroredElemTypes],
+      m
+    )
+
+  /**
+   * Non-inline assembly for Mirror-derived product codecs. Keeping this out-of-line means the
+   * anonymous class is defined once, not duplicated at every `derives` call site.
+   *
+   * `T` is `Mirror.ProductOf.MirroredMonoType` which by the Mirror contract `<: Product`; the cast
+   * inside `encode` reflects that contract — required because we can't bound `T` at the (inline)
+   * entry point without forcing every caller to satisfy it.
+   */
+  def productCodec[T](
+      labels: List[String],
+      codecs: List[Codec[Any]],
+      m: Mirror.ProductOf[T]
+  ): Codec[T] = new Codec[T] {
+
+    def decode(value: Any): Either[ConfigError, T] = value match {
+      case obj: PObject =>
+        val props = obj.getProperties.asScala
+        val perField = labels.zip(codecs).map { (label, c) =>
+          props.get(label) match {
+            case None      => Left(ConfigError.MissingProperty(label))
+            case Some(raw) => c.decode(raw).left.map(_.at(label))
+          }
+        }
+        sequence(perField).map(values => m.fromProduct(Tuple.fromArray(values.toArray)))
+      case other =>
+        Left(ConfigError.TypeMismatch("PObject", other))
+    }
+
+    /**
+     * Encode as `PObject` with `PClassInfo.Dynamic` — a `Composite` that `PcfRenderer` /
+     * `JsonRenderer` / etc. render as a Pkl object.
+     */
+    def encode(value: T): Any = {
+      val product = value.asInstanceOf[Product]
+      val props = mutable.LinkedHashMap.empty[String, Any]
+      labels.iterator.zip(codecs.iterator).zipWithIndex.foreach { case ((label, c), i) =>
+        props.update(label, c.encode(product.productElement(i)))
+      }
+      // PObject's Java constructor takes `Map<String, Object>`. The cast bridges Scala `Any` and
+      // Java `Object` — same erasure at runtime.
+      new PObject(PClassInfo.Dynamic, props.asJava.asInstanceOf[java.util.Map[String, Object]])
+    }
+  }
+
+  /**
+   * Sum codec for sealed traits / enums. Encode picks the branch via `m.ordinal`, dispatches to the
+   * branch's Codec, then re-tags the resulting `PObject` with a `PClassInfo` carrying the branch's
+   * name. Decode dispatches by class name (primary) or `_type` discriminator (fallback).
+   *
+   * Case-object branches go through the `Mirror.ProductOf` (singleton extends product) path, so
+   * their Codec encodes/decodes an empty PObject — the branch identity lives in the surrounding
+   * `PClassInfo`. A future step may special-case all-singleton sums to encode as a String of the
+   * branch name (more idiomatic for pure enums); deferred because the compile-time singleton check
+   * via `inline if + summonFrom` doesn't reduce to a literal Boolean in the current Scala 3.
+   */
+  def sumCodec[T](
+      branchLabels: List[String],
+      branchCodecs: List[Codec[Any]],
+      m: Mirror.SumOf[T]
+  ): Codec[T] = new Codec[T] {
+
+    def decode(value: Any): Either[ConfigError, T] = value match {
+      case obj: PObject =>
+        val byClassName = branchLabels.indexOf(obj.getClassInfo.getSimpleName)
+        val branchIndex =
+          if (byClassName >= 0) Right(byClassName)
+          else
+            obj.getProperties.asScala.get(DiscriminatorField) match {
+              case Some(s: String) =>
+                branchLabels.indexOf(s) match {
+                  case -1 =>
+                    Left(
+                      ConfigError.Custom(
+                        s"Unknown sum branch `$s`. Expected one of: ${branchLabels.mkString(", ")}"
+                      )
+                    )
+                  case i => Right(i)
+                }
+              case _ =>
+                Left(
+                  ConfigError.Custom(
+                    s"Cannot determine sum branch from class `${obj.getClassInfo.getDisplayName}` " +
+                      s"and no `$DiscriminatorField` discriminator was found. " +
+                      s"Expected one of: ${branchLabels.mkString(", ")}"
+                  )
+                )
+            }
+        branchIndex.flatMap(i => branchCodecs(i).decode(obj).map(_.asInstanceOf[T]))
+      case other =>
+        Left(ConfigError.TypeMismatch("PObject (sealed sum)", other))
+    }
+
+    def encode(value: T): Any = {
+      val i = m.ordinal(value)
+      val branchName = branchLabels(i)
+      branchCodecs(i).encode(value) match {
+        case obj: PObject =>
+          new PObject(brandedClassInfo(branchName), obj.getProperties)
+        case other => other
+      }
+    }
+  }
+
+  /** Discriminator field name for sum decode fallback. */
+  val DiscriminatorField = "_type"
+
+  /**
+   * Synthesize a `PClassInfo` carrying the branch's name. We don't have a real Pkl module to
+   * attach it to, so we pick a synthetic moduleName/URI; the value is only consumed by our own
+   * sum-decoder dispatch, which only reads `getSimpleName`.
+   */
+  def brandedClassInfo(branchName: String): PClassInfo[?] =
+    PClassInfo.get("$scala.sum", branchName, java.net.URI.create("scala:sum"))
+
+  inline def summonLabels[Labels <: Tuple]: List[String] = {
+    inline erasedValue[Labels] match {
+      case _: EmptyTuple => Nil
+      case _: (h *: t)   => constValue[h].asInstanceOf[String] :: summonLabels[t]
+    }
+  }
+
+  inline def summonCodecs[Types <: Tuple]: List[Codec[Any]] = {
+    inline erasedValue[Types] match {
+      case _: EmptyTuple => Nil
+      case _: (h *: t)   =>
+        summonInline[Codec[h]].asInstanceOf[Codec[Any]] :: summonCodecs[t]
+    }
+  }
+
+  // ---------- Shared helpers (used by both derivation and primitive instances) ----------
 
   /**
    * Pkl Listings/Lists are rendered via `instanceof java.util.List`, so the encoded form must be a
    * Java List. Build with a Scala `ArrayBuffer` (O(1) append, ordered) and convert at the boundary.
    */
-  private def encodeListing[A](xs: Iterable[A], c: Codec[A]): java.util.List[Any] = {
+  def encodeListing[A](xs: Iterable[A], c: Codec[A]): java.util.List[Any] = {
     val buf = mutable.ArrayBuffer.empty[Any]
     xs.foreach(x => buf += c.encode(x))
     buf.asJava
   }
 
   /** Pkl Mapping is a `LinkedHashMap` (insertion-ordered); use the Scala equivalent and convert. */
-  private def encodeMapping[K, V](
+  def encodeMapping[K, V](
       m: Map[K, V],
       kc: Codec[K],
       vc: Codec[V]
@@ -435,16 +556,16 @@ object Codec {
     out.asJava
   }
 
-  private def decodeCollection[A](
+  def decodeCollection[A](
       xs: java.util.Collection[?],
-      d: Decoder[A]
+      c: Codec[A]
   ): Either[ConfigError, IndexedSeq[A]] = {
-    val results = xs.asScala.iterator.map(d.decode).toList
+    val results = xs.asScala.iterator.map(c.decode).toList
     sequence(results).map(_.toIndexedSeq)
   }
 
   /** First-error-wins; returns the list of decoded values if all succeeded. */
-  private def sequence[A](
+  def sequence[A](
       results: Iterable[Either[ConfigError, A]]
   ): Either[ConfigError, List[A]] = {
     results.iterator
@@ -454,7 +575,7 @@ object Codec {
       .map(_.reverse)
   }
 
-  private def scalaDurationToPkl(fd: scala.concurrent.duration.FiniteDuration): PDuration = {
+  def scalaDurationToPkl(fd: scala.concurrent.duration.FiniteDuration): PDuration = {
     import java.util.concurrent.TimeUnit
     val unit = fd.unit match {
       case TimeUnit.NANOSECONDS  => DurationUnit.NANOS
