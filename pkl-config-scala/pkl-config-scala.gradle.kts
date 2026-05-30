@@ -19,10 +19,7 @@ plugins {
   id("pklPublishLibrary")
 }
 
-dependencies {
-  implementation(projects.pklCore)
-  implementation(libs.izumiReflect)
-}
+dependencies { implementation(projects.pklCore) }
 
 publishing {
   publications {

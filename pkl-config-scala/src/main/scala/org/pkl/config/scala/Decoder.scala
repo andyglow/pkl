@@ -15,13 +15,11 @@
  */
 package org.pkl.config.scala
 
-import izumi.reflect.Tag
-import izumi.reflect.macrortti.LightTypeTagRef
-import izumi.reflect.macrortti.LightTypeTagRef.{NameReference, SymName, UnionReference}
 import org.pkl.core.{PNull, PObject}
 
 import scala.compiletime.{constValue, erasedValue, summonInline}
 import scala.deriving.Mirror
+import scala.quoted.*
 
 /**
  * Decodes a Pkl runtime value into a Scala value of type `T`.
@@ -37,8 +35,8 @@ import scala.deriving.Mirror
  *
  * Implementations are typeclass instances: provided as `given`s in this companion for primitives
  * and the standard collection/option/either shapes; auto-derived via `Mirror.ProductOf` for case
- * classes and `Mirror.SumOf` for Scala 3 enums; auto-derived via izumi `Tag` for Scala 3 union and
- * singleton-literal types.
+ * classes and `Mirror.SumOf` for Scala 3 enums; auto-derived via a Scala 3 quoted macro for Scala 3
+ * union and singleton-literal types.
  */
 trait Decoder[T] {
   def decode(value: Any): Either[ConfigError, T]
@@ -225,113 +223,18 @@ object Decoder {
     }
   }
 
-  // ---------- izumi Tag-based: union types and singleton literals ----------
+  // ---------- Macro-driven: union types and singleton literals ----------
 
   /**
-   * Catch-all for types that Mirror cannot derive: Scala 3 unions (`A | B`) and singleton literals
-   * (`"hello"`). Lower priority than Mirror-derived instances by virtue of being on the companion's
-   * outer scope; the implicit-search rules pick Mirror first when applicable.
+   * Catch-all for types that `Mirror` cannot derive: Scala 3 unions (`A | B`) and singleton literal
+   * types (`"hello"`, `42`, `true`). Implemented as a Scala 3 quoted macro that inspects the
+   * call-site `TypeRepr` and emits the appropriate decoder. Mirror-based derivations win when
+   * applicable because they require a more specific summon (`Mirror.ProductOf[T]`) which only
+   * succeeds for products.
+   *
+   * Compile-time error if `T` is neither a union, singleton, nor has another in-scope decoder.
    */
-  inline given fromTag[T](using tag: Tag[T]): Decoder[T] = {
-    val ref = tag.tag.ref
-    ref match {
-      case u: UnionReference =>
-        unionDecoder[T](u)
-      case n: NameReference =>
-        n.ref match {
-          case lit: SymName.SymLiteral =>
-            singletonDecoder[T](lit.name)
-          case _ =>
-            throw new IllegalStateException(
-              s"No Decoder for type `${tag.tag}`. " +
-                s"Provide a `given Decoder[${tag.tag}]` or `derives Decoder`."
-            )
-        }
-      case _ =>
-        throw new IllegalStateException(s"No Decoder for type `${tag.tag}`.")
-    }
-  }
-
-  private def unionDecoder[T](u: UnionReference): Decoder[T] = instance { value =>
-    // Build a per-member decoder via Tag-recursion. We can't reify a Tag for an arbitrary
-    // AbstractReference at runtime, so we materialize a thin probe: try each branch by name.
-    // For the spike, we delegate to izumi's branch list and expect each branch to be a
-    // type that has its own Decoder visible in this companion's implicit scope.
-    val errors = scala.collection.mutable.ListBuffer.empty[ConfigError]
-    u.refs.iterator
-      .flatMap { branch =>
-        decodeForBranch(branch, value) match {
-          case Right(v) => Iterator.single(v)
-          case Left(e)  => errors += e; Iterator.empty
-        }
-      }
-      .nextOption() match {
-      case Some(v) => Right(v.asInstanceOf[T])
-      case None    =>
-        Left(
-          ConfigError.Custom(
-            s"Cannot decode `${describe(value)}` as any union branch: ${errors.map(_.getMessage).mkString("; ")}"
-          )
-        )
-    }
-  }
-
-  /**
-   * Decode a single union branch. Limited to scalar branches in the spike — full recursion into
-   * arbitrary parametrized branches would require materializing typeclass instances at runtime from
-   * a `LightTypeTagRef`, which is a separate design problem.
-   */
-  private def decodeForBranch(
-      branch: LightTypeTagRef.AppliedReferenceExceptUnion,
-      value: Any
-  ): Either[ConfigError, Any] = branch match {
-    case n: NameReference =>
-      n.ref match {
-        case lit: SymName.SymLiteral =>
-          val (expected, _) = parseLiteral(lit.name)
-          summon[Decoder[String]].decode(value).flatMap { decoded =>
-            if (decoded == expected) Right(decoded)
-            else {
-              Left(ConfigError.Custom(s"Singleton mismatch: expected `$expected`, got `$decoded`"))
-            }
-          }
-        case sym: SymName.NamedSymbol =>
-          sym.name match {
-            case "scala.Int"           => summon[Decoder[Int]].decode(value)
-            case "scala.Long"          => summon[Decoder[Long]].decode(value)
-            case "scala.Boolean"       => summon[Decoder[Boolean]].decode(value)
-            case "scala.Double"        => summon[Decoder[Double]].decode(value)
-            case "scala.Float"         => summon[Decoder[Float]].decode(value)
-            case "java.lang.String"    => summon[Decoder[String]].decode(value)
-            case "scala.Predef.String" => summon[Decoder[String]].decode(value)
-            case other                 =>
-              Left(ConfigError.Custom(s"Union branch `$other` not supported in spike"))
-          }
-        case _ => Left(ConfigError.Custom(s"Unsupported union branch: $branch"))
-      }
-    case _ => Left(ConfigError.Custom(s"Unsupported union branch: $branch"))
-  }
-
-  private def singletonDecoder[T](rendered: String): Decoder[T] = instance { value =>
-    val (expected, _) = parseLiteral(rendered)
-    value match {
-      case s: String if s == expected            => Right(s.asInstanceOf[T])
-      case b: java.lang.Boolean if b == expected => Right(b.asInstanceOf[T])
-      case l: java.lang.Long if l == expected    => Right(l.asInstanceOf[T])
-      case other => Left(ConfigError.Custom(s"Expected singleton `$expected`, got `$other`"))
-    }
-  }
-
-  private def parseLiteral(rendered: String): (Any, String) = {
-    if (rendered.length >= 2 && rendered.startsWith("\"") && rendered.endsWith("\"")) {
-      (rendered.substring(1, rendered.length - 1), "String")
-    } else if (rendered == "true" || rendered == "false") {
-      (java.lang.Boolean.valueOf(rendered), "Boolean")
-    } else {
-      try (java.lang.Long.valueOf(rendered), "Long")
-      catch case _: NumberFormatException => (rendered, "String")
-    }
-  }
+  inline given derivedFromType[T]: Decoder[T] = ${ DecoderMacros.derivedFromType[T] }
 
   // ---------- helpers ----------
 
@@ -356,10 +259,94 @@ object Decoder {
     }
     Right(out.result())
   }
+}
 
-  private def describe(v: Any): String = v match {
-    case null      => "null"
-    case s: String => s""""$s""""
-    case _         => s"${v.getClass.getSimpleName}($v)"
+private[scala] object DecoderMacros {
+
+  def derivedFromType[T: Type](using Quotes): Expr[Decoder[T]] = {
+    import quotes.reflect.*
+    TypeRepr.of[T].dealias match {
+      case OrType(left, right) =>
+        left.asType match {
+          case '[l] =>
+            right.asType match {
+              case '[r] =>
+                val ldec = Expr.summon[Decoder[l]].getOrElse {
+                  report.errorAndAbort(s"No Decoder for union branch `${left.show}`")
+                }
+                val rdec = Expr.summon[Decoder[r]].getOrElse {
+                  report.errorAndAbort(s"No Decoder for union branch `${right.show}`")
+                }
+                '{
+                  Decoder.instance[T] { value =>
+                    $ldec.decode(value) match {
+                      case Right(v) => Right(v.asInstanceOf[T])
+                      case Left(le) =>
+                        $rdec.decode(value) match {
+                          case Right(v) => Right(v.asInstanceOf[T])
+                          case Left(re) =>
+                            Left(
+                              ConfigError.Custom(
+                                s"Cannot decode `$value` as either union branch: " +
+                                  s"${le.getMessage}; ${re.getMessage}"
+                              )
+                            )
+                        }
+                    }
+                  }
+                }
+            }
+        }
+      case ConstantType(StringConstant(s)) =>
+        val expected = Expr(s)
+        '{
+          Decoder.instance[T] { value =>
+            value match {
+              case x: String if x == $expected => Right(x.asInstanceOf[T])
+              case other                       =>
+                Left(ConfigError.Custom(s"Expected singleton `${$expected}`, got `$other`"))
+            }
+          }
+        }
+      case ConstantType(BooleanConstant(b)) =>
+        val expected = Expr(b)
+        '{
+          Decoder.instance[T] { value =>
+            value match {
+              case x: java.lang.Boolean if x == $expected => Right(x.asInstanceOf[T])
+              case other                                  =>
+                Left(ConfigError.Custom(s"Expected singleton `${$expected}`, got `$other`"))
+            }
+          }
+        }
+      case ConstantType(LongConstant(l)) =>
+        val expected = Expr(l)
+        '{
+          Decoder.instance[T] { value =>
+            value match {
+              case x: java.lang.Long if x == $expected => Right(x.asInstanceOf[T])
+              case other                               =>
+                Left(ConfigError.Custom(s"Expected singleton `${$expected}`, got `$other`"))
+            }
+          }
+        }
+      case ConstantType(IntConstant(i)) =>
+        // Scala Int singletons must compare against Pkl's java.lang.Long emit.
+        val expected = Expr(i.toLong)
+        '{
+          Decoder.instance[T] { value =>
+            value match {
+              case x: java.lang.Long if x.longValue == $expected => Right(x.asInstanceOf[T])
+              case other                                         =>
+                Left(ConfigError.Custom(s"Expected singleton `${$expected}`, got `$other`"))
+            }
+          }
+        }
+      case other =>
+        report.errorAndAbort(
+          s"No given Decoder for `${other.show}`. " +
+            "Provide one explicitly, or use `derives Decoder` if it's a case class."
+        )
+    }
   }
 }
