@@ -20,7 +20,7 @@ plugins {
 }
 
 dependencies {
-  implementation(projects.pklConfigJava)
+  implementation(projects.pklCore)
   implementation(libs.izumiReflect)
 }
 
