@@ -26,14 +26,19 @@ import org.scalatest.funsuite.FixtureAnyFunSuite
  *
  *   - primitives (Int, String, Boolean, Long)
  *   - generic collections (Seq, List, Set, Map)
+ *   - collections of one-directional elements (union / Either / Option)
  *   - Option (with present and null sources)
- *   - Either (direct dispatch)
+ *   - Either (source dispatch)
  *   - Pair → Tuple2
  *   - case class via `Mirror.ProductOf` derivation (field-by-field, no java.lang.reflect)
  *   - nested case class
- *   - Scala 3 union via izumi `Tag` fallback
- *   - singleton string-literal via izumi `Tag` fallback
- *   - direct domain decoder (Duration)
+ *   - Scala 3 union and singleton string-literal via the quoted-macro fallback
+ *   - direct domain decoder (FiniteDuration)
+ *   - sum types (sealed trait, enum) via `Mirror.SumOf`
+ *
+ * Whole-module shapes use `to[T]`; individual properties are pulled with `getProperty(name)` and
+ * decoded via `decodeAs[T]` (the navigate-by-name `as(name)` sugar was removed — `to[T]` plus
+ * `decodeAs[T]` cover the surface).
  */
 class DecoderSpec extends FixtureAnyFunSuite {
 
@@ -49,54 +54,89 @@ class DecoderSpec extends FixtureAnyFunSuite {
 
   test("primitive: Int via top-level property") { ev =>
     val pmodule = ev.evaluate(ModuleSource.text("value = 42"))
-    assert(pmodule.as[Int]("value") == 42)
+    assert(pmodule.getProperty("value").decodeAs[Int] == Right(42))
   }
 
   test("primitive: String via top-level property") { ev =>
     val pmodule = ev.evaluate(ModuleSource.text("""value = "hello""""))
-    assert(pmodule.as[String]("value") == "hello")
+    assert(pmodule.getProperty("value").decodeAs[String] == Right("hello"))
   }
 
   test("Seq[Int] from Listing<Int>") { ev =>
     val pmodule = ev.evaluate(ModuleSource.text("value: Listing<Int> = new { 1; 2; 3 }"))
-    assert(pmodule.as[Seq[Int]]("value") == Seq(1, 2, 3))
+    assert(pmodule.getProperty("value").decodeAs[Seq[Int]] == Right(Seq(1, 2, 3)))
   }
 
   test("Set[Int] dedups Listing<Int>") { ev =>
     val pmodule = ev.evaluate(ModuleSource.text("value: Listing<Int> = new { 1; 2; 2; 3 }"))
-    assert(pmodule.as[Set[Int]]("value") == Set(1, 2, 3))
+    assert(pmodule.getProperty("value").decodeAs[Set[Int]] == Right(Set(1, 2, 3)))
   }
 
   test("Map[String, Int] from Mapping<String, Int>") { ev =>
     val pmodule = ev.evaluate(
       ModuleSource.text("""value: Mapping<String, Int> = new { ["a"] = 1; ["b"] = 2 }""")
     )
-    assert(pmodule.as[Map[String, Int]]("value") == Map("a" -> 1, "b" -> 2))
+    assert(pmodule.getProperty("value").decodeAs[Map[String, Int]] == Right(Map("a" -> 1, "b" -> 2)))
   }
 
   test("Option[Int] is Some on present value") { ev =>
     val pmodule = ev.evaluate(ModuleSource.text("value: Int? = 5"))
-    assert(pmodule.as[Option[Int]]("value") == Some(5))
+    assert(pmodule.getProperty("value").decodeAs[Option[Int]] == Right(Some(5)))
   }
 
   test("Option[Int] is None on null") { ev =>
     val pmodule = ev.evaluate(ModuleSource.text("value: Int? = null"))
-    assert(pmodule.as[Option[Int]]("value") == None)
+    assert(pmodule.getProperty("value").decodeAs[Option[Int]] == Right(None))
   }
 
   test("Either[String, Int] dispatches by source — String → Left") { ev =>
     val pmodule = ev.evaluate(ModuleSource.text("""value: String | Int = "hi""""))
-    assert(pmodule.as[Either[String, Int]]("value") == Left("hi"))
+    assert(pmodule.getProperty("value").decodeAs[Either[String, Int]] == Right(Left("hi")))
   }
 
   test("Either[String, Int] dispatches by source — Int → Right") { ev =>
     val pmodule = ev.evaluate(ModuleSource.text("value: String | Int = 42"))
-    assert(pmodule.as[Either[String, Int]]("value") == Right(42))
+    assert(pmodule.getProperty("value").decodeAs[Either[String, Int]] == Right(Right(42)))
+  }
+
+  // ---------- Collections of one-directional elements (decode-only / union elements) ----------
+  // These resolve only because the collection givens are split per-direction and require just a
+  // `Decoder` per element — a bundled `Codec[Seq[A]]` would demand `Codec[Either]`, which doesn't exist.
+
+  test("Listing<String|Int> decodes to Seq[Either[String, Int]]") { ev =>
+    val pmodule =
+      ev.evaluate(ModuleSource.text("""value: Listing<String|Int> = new { "a"; 1; "b" }"""))
+    assert(
+      pmodule.getProperty("value").decodeAs[Seq[Either[String, Int]]] ==
+        Right(Seq(Left("a"), Right(1), Left("b")))
+    )
+  }
+
+  test("Listing<Int|Boolean> decodes to List[Int | Boolean]") { ev =>
+    val pmodule = ev.evaluate(ModuleSource.text("value: Listing<Int|Boolean> = new { 1; true; 2 }"))
+    assert(pmodule.getProperty("value").decodeAs[List[Int | Boolean]] == Right(List(1, true, 2)))
+  }
+
+  test("Mapping<String, String|Int> decodes to Map with Either values") { ev =>
+    val pmodule = ev.evaluate(
+      ModuleSource.text("""value: Mapping<String, String|Int> = new { ["a"] = 1; ["b"] = "x" }""")
+    )
+    assert(
+      pmodule.getProperty("value").decodeAs[Map[String, Either[String, Int]]] ==
+        Right(Map("a" -> Right(1), "b" -> Left("x")))
+    )
+  }
+
+  test("Listing<Int?> decodes element-wise to Seq[Option[Int]]") { ev =>
+    val pmodule = ev.evaluate(ModuleSource.text("value: Listing<Int?> = new { 1; null; 3 }"))
+    assert(
+      pmodule.getProperty("value").decodeAs[Seq[Option[Int]]] == Right(Seq(Some(1), None, Some(3)))
+    )
   }
 
   test("Pair → (Int, String)") { ev =>
     val pmodule = ev.evaluate(ModuleSource.text("""value: Pair<Int, String> = Pair(7, "seven")"""))
-    assert(pmodule.as[(Int, String)]("value") == ((7, "seven")))
+    assert(pmodule.getProperty("value").decodeAs[(Int, String)] == Right((7, "seven")))
   }
 
   test("case class via Mirror.ProductOf — flat fields") { ev =>
@@ -122,35 +162,32 @@ class DecoderSpec extends FixtureAnyFunSuite {
     assert(pmodule.to[Citizen] == Citizen("Bob", Address("12345", "Springfield")))
   }
 
-  test("Duration via domain decoder preserves unit") { ev =>
+  test("FiniteDuration via domain decoder preserves unit") { ev =>
     val pmodule = ev.evaluate(ModuleSource.text("value: Duration = 5.ms"))
-    val d = pmodule.as[scala.concurrent.duration.Duration]("value")
     import scala.concurrent.duration.*
-    assert(d == FiniteDuration(5, MILLISECONDS))
+    assert(
+      pmodule.getProperty("value").decodeAs[FiniteDuration] == Right(FiniteDuration(5, MILLISECONDS))
+    )
   }
 
-  test("union Int | Boolean — Int side via Tag fallback") { ev =>
+  test("union Int | Boolean — Int side via macro fallback") { ev =>
     val pmodule = ev.evaluate(ModuleSource.text("value: Int | Boolean = 42"))
-    val r: Int | Boolean = pmodule.as[Int | Boolean]("value")
-    assert(r == 42)
+    assert(pmodule.getProperty("value").decodeAs[Int | Boolean] == Right(42))
   }
 
-  test("union Int | Boolean — Boolean side via Tag fallback") { ev =>
+  test("union Int | Boolean — Boolean side via macro fallback") { ev =>
     val pmodule = ev.evaluate(ModuleSource.text("value: Int | Boolean = true"))
-    val r: Int | Boolean = pmodule.as[Int | Boolean]("value")
-    assert(r == true)
+    assert(pmodule.getProperty("value").decodeAs[Int | Boolean] == Right(true))
   }
 
   test("""singleton "hello" succeeds when source matches""") { ev =>
     val pmodule = ev.evaluate(ModuleSource.text("""value: "hello" = "hello""""))
-    assert(pmodule.as["hello"]("value") == "hello")
+    assert(pmodule.getProperty("value").decodeAs["hello"] == Right("hello"))
   }
 
   test("""singleton "hello" errors when source doesn't match""") { ev =>
     val pmodule = ev.evaluate(ModuleSource.text("""value: String = "world""""))
-    intercept[ConfigError] {
-      pmodule.as["hello"]("value")
-    }
+    assert(pmodule.getProperty("value").decodeAs["hello"].isLeft)
   }
 
   // ---------- Sum-type derivation (Mirror.SumOf) ----------
@@ -164,17 +201,17 @@ class DecoderSpec extends FixtureAnyFunSuite {
       |value: Color = new Green {}
       |""".stripMargin
     val pmodule = ev.evaluate(ModuleSource.text(code))
-    assert(pmodule.as[Color]("value") == Color.Green)
+    assert(pmodule.getProperty("value").decodeAs[Color] == Right(Color.Green))
   }
 
   test("singleton enum decodes via `_type` discriminator") { ev =>
     val pmodule = ev.evaluate(ModuleSource.text("""value: Dynamic = new { _type = "Red" }"""))
-    assert(pmodule.as[Color]("value") == Color.Red)
+    assert(pmodule.getProperty("value").decodeAs[Color] == Right(Color.Red))
   }
 
   test("singleton enum errors on unknown branch") { ev =>
     val pmodule = ev.evaluate(ModuleSource.text("""value: Dynamic = new { _type = "Yellow" }"""))
-    val err = intercept[ConfigError] { pmodule.as[Color]("value") }
+    val err = pmodule.getProperty("value").decodeAs[Color].swap.toOption.get
     assert(err.getMessage.contains("Unknown sum branch `Yellow`"))
     assert(err.getMessage.contains("Red, Green, Blue"))
   }
@@ -187,7 +224,7 @@ class DecoderSpec extends FixtureAnyFunSuite {
       |value: Shape = new Square { sideLength = 2.0 }
       |""".stripMargin
     val pmodule = ev.evaluate(ModuleSource.text(code))
-    assert(pmodule.as[Shape]("value") == Square(2.0))
+    assert(pmodule.getProperty("value").decodeAs[Shape] == Right(Square(2.0)))
   }
 
   test("sealed trait dispatches each branch correctly") { ev =>
@@ -199,8 +236,8 @@ class DecoderSpec extends FixtureAnyFunSuite {
       |c: Shape = new Circle { radius = 1.0 }
       |""".stripMargin
     val pmodule = ev.evaluate(ModuleSource.text(code))
-    assert(pmodule.as[Shape]("s") == Square(3.5))
-    assert(pmodule.as[Shape]("c") == Circle(1.0))
+    assert(pmodule.getProperty("s").decodeAs[Shape] == Right(Square(3.5)))
+    assert(pmodule.getProperty("c").decodeAs[Shape] == Right(Circle(1.0)))
   }
 
   test("sealed trait falls back to `_type` discriminator when class name doesn't match") { ev =>
@@ -211,7 +248,7 @@ class DecoderSpec extends FixtureAnyFunSuite {
       |}
       |""".stripMargin
     val pmodule = ev.evaluate(ModuleSource.text(code))
-    assert(pmodule.as[Shape]("value") == Square(7.0))
+    assert(pmodule.getProperty("value").decodeAs[Shape] == Right(Square(7.0)))
   }
 
   test("sealed trait errors when neither class name nor `_type` identifies a branch") { ev =>
@@ -219,7 +256,7 @@ class DecoderSpec extends FixtureAnyFunSuite {
       |value: Dynamic = new { sideLength = 1.0 }
       |""".stripMargin
     val pmodule = ev.evaluate(ModuleSource.text(code))
-    val err = intercept[ConfigError] { pmodule.as[Shape]("value") }
+    val err = pmodule.getProperty("value").decodeAs[Shape].swap.toOption.get
     assert(err.getMessage.contains("Cannot determine sum branch"))
     assert(err.getMessage.contains("Square, Circle"))
   }
