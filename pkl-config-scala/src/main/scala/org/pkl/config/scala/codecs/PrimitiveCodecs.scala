@@ -20,8 +20,9 @@ import org.pkl.core.{DurationUnit, Duration as PDuration}
 
 /**
  * Scalar / leaf-type codecs: numeric and string primitives plus single-value domain types
- * (`Duration`, `FiniteDuration`, `Instant`, `Regex`). Mixed into the `Codec` companion at
- * top priority — these win over `LowPriorityCodecs.derived`.
+ * (`FiniteDuration`, `Instant`, `Regex`). These are genuine bijections, so each ships as a single
+ * `given Codec[T]` mixed into the `Codec` companion; subsumption (`Codec <: Encoder, Decoder`) lets
+ * one instance serve `Encoder[T]` and `Decoder[T]` queries too.
  */
 private[scala] trait PrimitiveCodecs {
 
@@ -71,13 +72,20 @@ private[scala] trait PrimitiveCodecs {
     }
   )
 
-  given Codec[scala.concurrent.duration.Duration] = Codec.named(
-    "Duration",
-    enc = {
-      case fd: scala.concurrent.duration.FiniteDuration => scalaDurationToPkl(fd)
-      case _                                            =>
-        // Pkl has no infinite duration; lossy. Real fix: refuse at compile time via a `FiniteDuration` codec.
-        null
+  given Codec[scala.concurrent.duration.FiniteDuration] = Codec.named(
+    "FiniteDuration",
+    enc = { fd =>
+      import java.util.concurrent.TimeUnit
+      val unit = fd.unit match {
+        case TimeUnit.NANOSECONDS => DurationUnit.NANOS
+        case TimeUnit.MICROSECONDS => DurationUnit.MICROS
+        case TimeUnit.MILLISECONDS => DurationUnit.MILLIS
+        case TimeUnit.SECONDS => DurationUnit.SECONDS
+        case TimeUnit.MINUTES => DurationUnit.MINUTES
+        case TimeUnit.HOURS => DurationUnit.HOURS
+        case TimeUnit.DAYS => DurationUnit.DAYS
+      }
+      new PDuration(fd.length.toDouble, unit)
     },
     dec = {
       case d: PDuration =>
@@ -96,19 +104,6 @@ private[scala] trait PrimitiveCodecs {
     }
   )
 
-  given Codec[scala.concurrent.duration.FiniteDuration] = {
-    val parent = summon[Codec[scala.concurrent.duration.Duration]]
-    Codec.instance(
-      enc = (fd: scala.concurrent.duration.FiniteDuration) => parent.encode(fd),
-      dec = (v: Any) => {
-        parent.decode(v).flatMap {
-          case fd: scala.concurrent.duration.FiniteDuration => Right(fd)
-          case _ => Left(ConfigError.Custom("Pkl Duration is not finite"))
-        }
-      }
-    )
-  }
-
   given Codec[java.time.Instant] = Codec.named(
     "Instant",
     enc = (i: java.time.Instant) => i.toString, // ISO-8601
@@ -126,18 +121,4 @@ private[scala] trait PrimitiveCodecs {
       case p: java.util.regex.Pattern => Right(p.pattern.r)
     }
   )
-
-  private def scalaDurationToPkl(fd: scala.concurrent.duration.FiniteDuration): PDuration = {
-    import java.util.concurrent.TimeUnit
-    val unit = fd.unit match {
-      case TimeUnit.NANOSECONDS  => DurationUnit.NANOS
-      case TimeUnit.MICROSECONDS => DurationUnit.MICROS
-      case TimeUnit.MILLISECONDS => DurationUnit.MILLIS
-      case TimeUnit.SECONDS      => DurationUnit.SECONDS
-      case TimeUnit.MINUTES      => DurationUnit.MINUTES
-      case TimeUnit.HOURS        => DurationUnit.HOURS
-      case TimeUnit.DAYS         => DurationUnit.DAYS
-    }
-    new PDuration(fd.length.toDouble, unit)
-  }
 }

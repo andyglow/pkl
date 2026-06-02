@@ -37,14 +37,6 @@ object syntax {
     inline def to[T](using d: Decoder[T]): T = {
       d.decode(o).fold(throw _, identity)
     }
-
-    /**
-     * Navigate into a child property and decode it. (`get` would clash with `Composite.get(name)`
-     * which returns raw Object.)
-     */
-    inline def as[T](name: String)(using d: Decoder[T]): T = {
-      d.decode(o.getProperty(name)).fold(throw _, identity)
-    }
   }
 
   /** For ad-hoc decoding of a property value pulled out by name (typed Pkl primitives, etc.). */

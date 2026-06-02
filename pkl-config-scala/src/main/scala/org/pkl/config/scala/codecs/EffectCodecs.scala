@@ -15,42 +15,25 @@
  */
 package org.pkl.config.scala.codecs
 
-import org.pkl.config.scala.{Codec, ConfigError, Decoder}
+import org.pkl.config.scala.{Decoder, Encoder}
 import org.pkl.core.PNull
 
 /**
- * Codec for `Option[A]`: encodes `None` as `null` and `Some(a)` via the underlying `Codec[A]`.
- * Decode also accepts Pkl's `PNull` sentinel. Mixed into the `Codec` companion at top priority.
+ * `Option` and `Either` decoders, split into the per-direction effect traits.
  *
- * `Either` does NOT live here — see [[EffectDecoders]] in the same file for why.
- */
-private[scala] trait EffectCodecs {
-
-  given [A](using c: Codec[A]): Codec[Option[A]] = Codec.instance(
-    enc = {
-      case Some(a) => c.encode(a)
-      case None    => null
-    },
-    dec = {
-      case null | _: PNull => Right(None)
-      case other           => c.decode(other).map(Some(_))
-    }
-  )
-}
-
-/**
- * `Either[L, R]` is decoder-only and lives in the `Decoder` companion (top decoder tier) so it
- * wins over the auto-derived `Codec[Either[L, R]]` reachable via `LowPriorityCodecs.derived` —
- * Either is a Scala sealed sum (so Mirror.SumOf would derive a class-name-dispatched Codec for
- * it), but we want union-style source dispatch (try `L`, fall back to `R`) instead.
- *
- * Encoding has no canonical inverse since the source union dropped the tag; that's why this is
- * a `Decoder` rather than a `Codec`.
- *
- * Mixed into `Codec.Decoder` rightmost in the parents list so its given out-prioritizes
- * `LowPriorityDecoders.fromCodec[Either[L, R]]`.
+ *   - `Option[A]` decodes `null` / Pkl's `PNull` sentinel to `None`, anything else via `Decoder[A]`.
+ *   - `Either[L, R]` decodes by **source dispatch**: try `L`, fall back to `R`. Pkl unions carry no
+ *     tag, so there is no class-name to match on — this is deliberately NOT the `Mirror.SumOf`-derived
+ *     decoder (which would dispatch on a `Left`/`Right` class tag). Mixed into the `Decoder` companion
+ *     rightmost (most specific by linearization) so it out-prioritizes the recursive `derivedDecoder`
+ *     given that `Mirror.SumOf[Either]` would otherwise satisfy.
  */
 private[scala] trait EffectDecoders {
+
+  given [A](using d: Decoder[A]): Decoder[Option[A]] = Decoder.instance {
+    case null | _: PNull => Right(None)
+    case other           => d.decode(other).map(Some(_))
+  }
 
   given decoderForEither[L, R](using ld: Decoder[L], rd: Decoder[R]): Decoder[Either[L, R]] = {
     Decoder.instance { value =>
@@ -58,6 +41,34 @@ private[scala] trait EffectDecoders {
         case Right(l) => Right(Left(l))
         case Left(_)  => rd.decode(value).map(Right(_))
       }
+    }
+  }
+}
+
+/**
+ * `Option` and `Either` encoders, the matching encode halves of [[EffectDecoders]].
+ *
+ *   - `Option[A]` encodes `None` as `null` and `Some(a)` via `Encoder[A]`.
+ *   - `Either[L, R]` encodes by dispatching on the Scala-side constructor tag: `Left(l)` emits the
+ *     encoding of `l`, `Right(r)` emits the encoding of `r`. This is total and lossless on its own —
+ *     the "dropped tag" only bites on decode (Pkl→Scala), never on encode — and matches the
+ *     source-union semantics of [[EffectDecoders.decoderForEither]] (encode then decode round-trips
+ *     whenever `L` and `R` are distinguishable Pkl shapes). Without it, encode would fall through to
+ *     the `Mirror.SumOf`-derived sum encoder, whose `Left`/`Right`-tagged `PObject` would NOT round-trip
+ *     through the union decoder. Mixed into the `Encoder` companion rightmost so it out-prioritizes
+ *     `derivedEncoder`.
+ */
+private[scala] trait EffectEncoders {
+
+  given [A](using e: Encoder[A]): Encoder[Option[A]] = Encoder.instance {
+    case Some(a) => e.encode(a)
+    case None    => null
+  }
+
+  given encoderForEither[L, R](using le: Encoder[L], re: Encoder[R]): Encoder[Either[L, R]] = {
+    Encoder.instance {
+      case Left(l)  => le.encode(l)
+      case Right(r) => re.encode(r)
     }
   }
 }

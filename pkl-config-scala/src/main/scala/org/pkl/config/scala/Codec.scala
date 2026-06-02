@@ -27,7 +27,8 @@ type Encoder[T] = Codec.Encoder[T]
 type Decoder[T] = Codec.Decoder[T]
 
 /**
- * Term-level alias so `Decoder.instance(...)` and `derives Decoder` resolve to the canonical site.
+ * Term-level alias so `Encoder.instance(...)` / `Decoder.instance(...)` and the `derives` clauses
+ * resolve to the canonical site.
  */
 val Encoder = Codec.Encoder
 val Decoder = Codec.Decoder
@@ -35,15 +36,30 @@ val Decoder = Codec.Decoder
 /**
  * A round-trip-capable typeclass bundling encode and decode for a single type.
  *
- * Codec is a separate trait, NOT a subtype of `Encoder[T]` and `Decoder[T]`. Subtyping would make
- * `Codec.derived` a candidate for `Decoder[T]` queries at the same priority as hand-written
- * decoders (e.g. `Decoder.decoderForEither`), with no clean way to disambiguate. With subtyping
- * dropped, `Decoder.fromCodec[T]` (defined in `LowPriorityDecoders`) is the explicit bridge —
- * lower priority than direct decoders, higher than the macro fallback for unions/literals.
+ * `Codec[T]` is a SUBTYPE of `Encoder[T]` and `Decoder[T]` (bottom-up design). Encoder and Decoder
+ * are the primitives; `Codec` is the composite. Two consequences fall out of the subtyping:
  *
- * Round-trippable types ship as `given Codec[T]` so a single instance covers both directions; types
- * for which one side is meaningless (e.g. `Either[L, R]`) ship a `given Decoder[T]` (or
- * `given Encoder[T]`) only.
+ *   - A single round-trippable instance written as `given Codec[T]` (primitives, collections,
+ *     `Option`) directly satisfies `Encoder[T]` and `Decoder[T]` queries by subsumption — no bridge
+ *     given is needed in either direction. (The old design had a `fromCodec` bridge in BOTH the
+ *     `Encoder` and `Decoder` companions; that closed a Codec ⇄ Decoder cycle and forced a tower of
+ *     priority traits to linearize it. Both bridges are gone.)
+ *   - Mirror derivation lives on the two halves (`Encoder.derived` / `Decoder.derived`), each its own
+ *     traversal, NOT on `Codec`. There is deliberately no derived-`Codec` given: such a given, being
+ *     `<: Decoder`, would look MORE specific than a hand-written `Decoder` (e.g.
+ *     `decoderForEither`) and silently win — the exact ambiguity that made an earlier subtyping
+ *     attempt fail. With derivation on the halves, an `Either` decoder query sees two `Decoder`-typed
+ *     candidates and ordinary linearization lets the hand-written one win.
+ *
+ * `Codec[T]` for a derivable type is assembled from its halves explicitly — via `Codec.from(e, d)`
+ * or the `derives Codec` clause (which calls `Codec.derived = from(Encoder.derived, Decoder.derived)`).
+ * There is deliberately NO implicit `Codec`-from-parts given: such a given would be `<: Decoder` and
+ * `<: Encoder`, so it would re-enter `Decoder[T]`/`Encoder[T]` resolution as a universal, maximally
+ * type-specific candidate and collide with hand-written direction-specific givens (the `Either` case:
+ * type-specificity favours the parts given, owner-specificity favours `decoderForEither`, and Scala
+ * reports ambiguity). Keeping the join explicit is the same boundary circe draws. Types for which one
+ * direction is meaningful and the other isn't simply ship the half that exists; no `Codec`
+ * materializes unless BOTH halves are assembled deliberately.
  *
  * The Pkl runtime value model that encoders produce and decoders consume:
  *   - boxed primitives: `java.lang.Long`, `java.lang.Double`, `java.lang.Boolean`, `String`
@@ -56,14 +72,21 @@ val Decoder = Codec.Decoder
  *     hand back its `.asJava` view (insertion order preserved).
  *   - domain values: `org.pkl.core.{Duration, Pair}`, `byte[]`, `java.util.regex.Pattern`
  *
- * Category-specific given instances live under `org.pkl.config.scala.codecs.*` and are mixed into
- * this companion (see the `extends` clause on `object Codec`). Mix-in order matters: traits later
- * in the list are more specific by linearization, so primitives/collections/effects out-prioritize
- * the Mirror-derived `LowPriorityCodecs.derived`.
+ * Instances are organized to match the bottom-up shape:
+ *   - leaf bijections (primitives, `Duration`, `Instant`, `Regex`) ship as `given Codec[T]` in
+ *     [[org.pkl.config.scala.codecs.PrimitiveCodecs]], mixed into THIS companion — they genuinely
+ *     round-trip, so one instance serves all three queries by subsumption.
+ *   - structural combinators (`Seq`/`List`/`Set`/`Map`/`Tuple2`, `Option`, `Either`) ship as
+ *     per-direction givens mixed into the `Encoder` / `Decoder` companions, so each direction needs
+ *     only the matching half of its element type (a `Listing<String|Int>` decodes fine even though
+ *     `Either`/unions have no `Codec`).
+ *   - composites (`derives`) derive each half independently via `Encoder.derived` / `Decoder.derived`.
+ *
+ * Mix-in order within a companion matters: traits later in the `extends` list are more specific by
+ * linearization, so combinators/effects out-prioritize the `Mirror`-derived `derivedEncoder` /
+ * `derivedDecoder`.
  */
-trait Codec[T] { self =>
-  def encode(value: T): Any
-  def decode(value: Any): Either[ConfigError, T]
+trait Codec[T] extends Codec.Encoder[T], Codec.Decoder[T] { self =>
 
   /** Newtype-style profunctor map: derive a `Codec[U]` from a bijection between `T` and `U`. */
   def imap[U](f: T => U, g: U => T): Codec[U] = new Codec[U] {
@@ -72,7 +95,7 @@ trait Codec[T] { self =>
   }
 }
 
-object Codec extends LowPriorityCodecs, PrimitiveCodecs, CollectionCodecs, EffectCodecs {
+object Codec extends PrimitiveCodecs {
 
   // ---------- Encoder ----------
 
@@ -83,18 +106,15 @@ object Codec extends LowPriorityCodecs, PrimitiveCodecs, CollectionCodecs, Effec
     }
   }
 
-  object Encoder {
+  object Encoder extends LowPriorityEncoders, CollectionEncoders, EffectEncoders {
     def apply[T](using e: Encoder[T]): Encoder[T] = e
 
     def instance[T](f: T => Any): Encoder[T] = new Encoder[T] {
       def encode(value: T): Any = f(value)
     }
 
-    /** Wraps any `Codec[T]` as an `Encoder[T]`. */
-    given fromCodec[T](using c: Codec[T]): Encoder[T] = instance(c.encode)
-
-    /** Used by `derives Encoder` on case classes, sealed traits, and enums; delegates to `Codec.derived`. */
-    inline def derived[T](using m: Mirror.Of[T]): Encoder[T] = instance(Codec.derived[T].encode)
+    /** Backs `derives Encoder` on case classes, sealed traits, and enums. */
+    inline def derived[T](using m: Mirror.Of[T]): Encoder[T] = deriveEncoder[T]
   }
 
   // ---------- Decoder ----------
@@ -111,39 +131,15 @@ object Codec extends LowPriorityCodecs, PrimitiveCodecs, CollectionCodecs, Effec
     }
   }
 
-  object Decoder extends LowPriorityDecoders, EffectDecoders {
+  object Decoder extends LowPriorityDecoders, CollectionDecoders, EffectDecoders {
     def apply[T](using d: Decoder[T]): Decoder[T] = d
 
     def instance[T](f: Any => Either[ConfigError, T]): Decoder[T] = new Decoder[T] {
       def decode(value: Any): Either[ConfigError, T] = f(value)
     }
 
-    /** Used by `derives Decoder` on case classes, sealed traits, and enums; delegates to `Codec.derived`. */
-    inline def derived[T](using m: Mirror.Of[T]): Decoder[T] = instance(Codec.derived[T].decode)
-  }
-
-  /**
-   * Mid-priority givens. Loses to hand-written direct members (e.g. `decoderForEither`); wins over
-   * the macro fallback for unions/literals.
-   */
-  sealed trait LowPriorityDecoders extends LowestPriorityDecoders {
-
-    /** Wraps any `Codec[T]` as a `Decoder[T]` — covers products, sealed sums, primitives, etc. */
-    given fromCodec[T](using c: Codec[T]): Decoder[T] = Decoder.instance(c.decode)
-  }
-
-  /**
-   * Lowest-priority given. The macro pattern-matches the call-site `TypeRepr`; only types with no
-   * `Codec[T]` and no hand-written `Decoder[T]` reach this rule.
-   */
-  sealed trait LowestPriorityDecoders {
-
-    /**
-     * Catch-all for Scala 3 unions (`A | B`) and singleton-literal types (`"hello"`, `42`, `true`).
-     * Implemented as a quoted macro that pattern-matches the call-site `TypeRepr` and emits an
-     * appropriate decoder. Compile-time error if `T` is none of those.
-     */
-    inline given derivedFromType[T]: Decoder[T] = ${ CodecMacros.derivedDecoderFromType[T] }
+    /** Backs `derives Decoder` on case classes, sealed traits, and enums. */
+    inline def derived[T](using m: Mirror.Of[T]): Decoder[T] = deriveDecoder[T]
   }
 
   // ---------- Codec factories ----------
@@ -159,6 +155,15 @@ object Codec extends LowPriorityCodecs, PrimitiveCodecs, CollectionCodecs, Effec
     def encode(value: T): Any = enc(value)
     def decode(value: Any): Either[ConfigError, T] = dec(value)
   }
+
+  /**
+   * Backs `derives Codec`. Assembles a `Codec[T]` from the two independently-derived halves; a
+   * derivable type therefore needs both an `Encoder` and a `Decoder` for every field. (A field for
+   * which only one direction exists — e.g. an encode-only type — blocks `derives Codec`; ship that
+   * field's missing half, or split the enclosing type's derivation.)
+   */
+  inline def derived[T](using m: Mirror.Of[T]): Codec[T] =
+    from(Encoder.derived[T], Decoder.derived[T])
 
   /**
    * Sugar over [[instance]] for the common case where `dec` only handles a few specific types and
@@ -178,37 +183,50 @@ object Codec extends LowPriorityCodecs, PrimitiveCodecs, CollectionCodecs, Effec
 }
 
 /**
- * `Codec.derived` lives here, one priority tier below `Codec`'s direct givens, so that hand-written
- * decoders/encoders on companions of types like `Either` win over Mirror-driven derivation. (The
- * `Codec` object is in the implicit scope of `Decoder[T]` because `Decoder` is a member of `Codec`;
- * if `derived` lived directly on `Codec` it would compete head-to-head with `Decoder.decoderForEither`
- * and produce ambiguity errors.)
- *
- * Sum and product machinery live in `codecs.{ProductTypeCodecs, SumTypeCodecs}`; this trait
- * inherits both and contributes only the dispatching `derived` given. Sealed so only `Codec`
- * extends it.
+ * Mid-priority `Encoder` derivation. Mixed into the `Encoder` companion BEFORE `EffectEncoders`, so
+ * hand-written encoders (e.g. `encoderForEither`) win over the `Mirror`-derived sum/product encoder.
  */
-sealed trait LowPriorityCodecs extends ProductTypeCodecs, SumTypeCodecs {
+sealed trait LowPriorityEncoders extends ProductTypeCodecs, SumTypeCodecs {
+
+  inline def deriveEncoder[T](using m: Mirror.Of[T]): Encoder[T] =
+    inline m match {
+      case s: Mirror.SumOf[T]     => derivedSumEncoder[T](s)
+      case p: Mirror.ProductOf[T] => derivedProductEncoder[T](p)
+    }
+
+  /** Auto-derives `Encoder[T]` for case classes, sealed traits, and enums; recursive on fields. */
+  inline given derivedEncoder[T](using m: Mirror.Of[T]): Encoder[T] = deriveEncoder[T]
+}
+
+/**
+ * Mid-priority `Decoder` derivation. Mixed into the `Decoder` companion BEFORE `EffectDecoders`
+ * (so `decoderForEither` wins) and AFTER `LowestPriorityDecoders` (so a real Mirror-derived decoder
+ * wins over the union/literal macro fallback).
+ */
+sealed trait LowPriorityDecoders extends ProductTypeCodecs, SumTypeCodecs, LowestPriorityDecoders {
+
+  inline def deriveDecoder[T](using m: Mirror.Of[T]): Decoder[T] =
+    inline m match {
+      case s: Mirror.SumOf[T]     => derivedSumDecoder[T](s)
+      case p: Mirror.ProductOf[T] => derivedProductDecoder[T](p)
+    }
+
+  /** Auto-derives `Decoder[T]` for case classes, sealed traits, and enums; recursive on fields. */
+  inline given derivedDecoder[T](using m: Mirror.Of[T]): Decoder[T] = deriveDecoder[T]
+}
+
+/**
+ * Lowest-priority `Decoder` given. The macro pattern-matches the call-site `TypeRepr`; only types
+ * with no `given Codec`/`Decoder` and no `Mirror` reach this rule.
+ */
+sealed trait LowestPriorityDecoders {
 
   /**
-   * Auto-derives `Codec[T]` for case classes, sealed traits, and Scala 3 enums via `Mirror`.
-   *
-   *   - Product (case class, including case object as zero-field product): encode to
-   *     `PObject(PClassInfo.Dynamic, ...)`; decode field-by-field from a `PObject`'s properties.
-   *   - Sum (sealed trait, enum): encode by dispatching to the branch Codec and re-tagging the
-   *     resulting `PObject` with the branch's name; decode by matching
-   *     `PObject.getClassInfo.getSimpleName` against branch labels, falling back to a `_type`
-   *     discriminator field. Pure-singleton enums (every branch a case object) currently encode as
-   *     PObject too — a future step may special-case them to encode as a `String` of the case name.
-   *
-   * Backs `derives Codec`, `derives Decoder`, `derives Encoder`.
+   * Catch-all for Scala 3 unions (`A | B`) and singleton-literal types (`"hello"`, `42`, `true`).
+   * Implemented as a quoted macro that pattern-matches the call-site `TypeRepr` and emits an
+   * appropriate decoder. Compile-time error if `T` is none of those.
    */
-  inline given derived[T](using m: Mirror.Of[T]): Codec[T] = {
-    inline m match {
-      case s: Mirror.SumOf[T]     => derivedSum[T](s)
-      case p: Mirror.ProductOf[T] => derivedProduct[T](p)
-    }
-  }
+  inline given derivedFromType[T]: Decoder[T] = ${ CodecMacros.derivedDecoderFromType[T] }
 }
 
 private[scala] object CodecMacros {

@@ -15,19 +15,24 @@
  */
 package org.pkl.config.scala.codecs
 
-import org.pkl.config.scala.{Codec, ConfigError}
+import org.pkl.config.scala.{ConfigError, Decoder, Encoder}
 
 import scala.compiletime.{constValue, erasedValue, summonInline}
 
 /**
- * Shared internals used by category-specific codec traits. `sequence` is the first-error-wins
+ * Shared internals used by the derivation traits. `sequence` is the first-error-wins
  * `List[Either[E, A]] => Either[E, List[A]]` combinator that products, collections, and the Map
- * codec all need; `summonLabels` / `summonCodecs` walk the `Mirror`-derived `Tuple` types into
- * runtime lists used by the product / sum derivation paths.
+ * codec all need; `summonLabels` / `summonEncoders` / `summonDecoders` walk the `Mirror`-derived
+ * `Tuple` types into runtime lists used by the product / sum derivation paths.
  *
- * Members are public so inline expansion of `Codec.derived` at user call sites can still reach
- * them through the `Codec` object's inheritance chain. The trait itself is `private[scala]` to
- * keep the surface internal.
+ * In the bottom-up design encode and decode are derived independently (each summoning its own half),
+ * so there is a separate summoner per direction — no `summonCodecs`. A field's `Encoder`/`Decoder`
+ * resolves either to a concrete `given Codec[F]` (which IS both, via `Codec <: Encoder, Decoder`) or
+ * to the recursive `derivedEncoder`/`derivedDecoder` given.
+ *
+ * Members are public so inline expansion of `derived` at user call sites can still reach them
+ * through the `Encoder`/`Decoder` objects' inheritance chain. The trait itself is `private[scala]`
+ * to keep the surface internal.
  */
 private[scala] trait CodecHelpers {
 
@@ -49,11 +54,19 @@ private[scala] trait CodecHelpers {
     }
   }
 
-  inline def summonCodecs[Types <: Tuple]: List[Codec[Any]] = {
+  inline def summonEncoders[Types <: Tuple]: List[Encoder[Any]] = {
     inline erasedValue[Types] match {
       case _: EmptyTuple => Nil
       case _: (h *: t)   =>
-        summonInline[Codec[h]].asInstanceOf[Codec[Any]] :: summonCodecs[t]
+        summonInline[Encoder[h]].asInstanceOf[Encoder[Any]] :: summonEncoders[t]
+    }
+  }
+
+  inline def summonDecoders[Types <: Tuple]: List[Decoder[Any]] = {
+    inline erasedValue[Types] match {
+      case _: EmptyTuple => Nil
+      case _: (h *: t)   =>
+        summonInline[Decoder[h]].asInstanceOf[Decoder[Any]] :: summonDecoders[t]
     }
   }
 }
